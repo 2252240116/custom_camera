@@ -1,0 +1,569 @@
+package com.yunlu.salesman.ui.recordOrder
+
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.res.Resources
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.hardware.Camera
+import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
+import android.util.DisplayMetrics
+import android.util.Log
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.View
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.RelativeLayout
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import com.yunlu.salesman.R
+import com.yunlu.salesman.base.http.FileUtil
+import com.yunlu.salesman.base.http.RetrofitFormNetwork
+import com.yunlu.salesman.base.utils.LocalManageUtil
+import com.yunlu.salesman.base.utils.LogUtils
+import com.yunlu.salesman.base.utils.ToastUtils
+import com.yunlu.salesman.ui.order.presenter.OrderPresenter
+import rx.Observable
+import rx.Subscriber
+import rx.android.schedulers.AndroidSchedulers
+import rx.schedulers.Schedulers
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class CameraActivity : AppCompatActivity(), SurfaceHolder.Callback, Camera.PictureCallback {
+
+    companion object {
+        private const val TAG = "CameraActivity"
+        private const val CAMERA_PERMISSION_REQUEST = 100
+        private const val STORAGE_PERMISSION_REQUEST = 101
+        private const val PICK_IMAGE_REQUEST = 200
+    }
+
+    private var camera: Camera? = null
+    private var surfaceView: SurfaceView? = null
+    private var previewImage: ImageView? = null
+    private var previewTouchImage: TouchImageView? = null
+    private var previewControls: LinearLayout? = null
+    private var rlBottomTake: RelativeLayout? = null
+
+    private var currentPhotoFile: File? = null
+    private var orderPresenter: OrderPresenter? = null
+    private var isSurfaceCreated = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_FULLSCREEN,
+            WindowManager.LayoutParams.FLAG_FULLSCREEN
+        )
+        setContentView(R.layout.activity_camera)
+        setContainerHeight()
+        orderPresenter = OrderPresenter(this, null)
+
+        initViews()
+        checkPermissions()
+    }
+
+    private fun setContainerHeight() {
+        val container = findViewById<RelativeLayout>(R.id.container)
+        val displayMetrics = DisplayMetrics()
+        windowManager.defaultDisplay.getMetrics(displayMetrics)
+        val screenHeight = displayMetrics.heightPixels
+        val containerHeight = (screenHeight * 0.6).toInt()
+
+        val params = container.layoutParams
+        params.height = containerHeight
+        container.layoutParams = params
+    }
+
+    private fun initViews() {
+        surfaceView = findViewById(R.id.camera_preview)
+        previewImage = findViewById(R.id.preview_image)
+        previewTouchImage = findViewById(R.id.preview_touch_image)
+        previewControls = findViewById(R.id.preview_controls)
+        rlBottomTake = findViewById(R.id.rl_bottom_take)
+
+        findViewById<Button>(R.id.btn_capture).setOnClickListener { captureImage() }
+        findViewById<TextView>(R.id.btn_cancel).setOnClickListener { finish() }
+        findViewById<TextView>(R.id.btn_album).setOnClickListener { openGallery() }
+        findViewById<Button>(R.id.btn_retake).setOnClickListener { resetCamera() }
+        findViewById<Button>(R.id.btn_confirm).setOnClickListener { uploadImage() }
+
+        surfaceView?.holder?.apply {
+            addCallback(this@CameraActivity)
+            setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS)
+        }
+    }
+
+    private fun checkPermissions() {
+        val permissionsNeeded = mutableListOf<String>()
+
+        if (!checkCameraPermission()) {
+            permissionsNeeded.add(Manifest.permission.CAMERA)
+        }
+
+        if (!checkStoragePermission()) {
+            permissionsNeeded.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+
+        if (permissionsNeeded.isNotEmpty()) {
+            ActivityCompat.requestPermissions(
+                this,
+                permissionsNeeded.toTypedArray(),
+                CAMERA_PERMISSION_REQUEST
+            )
+        } else {
+            initCamera()
+        }
+    }
+
+    private fun checkCameraPermission() = ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.CAMERA
+    ) == PackageManager.PERMISSION_GRANTED
+
+    private fun checkStoragePermission() = ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.WRITE_EXTERNAL_STORAGE
+    ) == PackageManager.PERMISSION_GRANTED
+
+    private fun initCamera() {
+        if (isSurfaceCreated) {
+            startCameraPreview()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (checkCameraPermission() && isSurfaceCreated) {
+            startCameraPreview()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        releaseCamera()
+    }
+
+    private fun startCameraPreview() {
+        try {
+            releaseCamera()
+            camera = Camera.open(Camera.CameraInfo.CAMERA_FACING_BACK).apply {
+                val parameters = parameters.apply {
+                    focusMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE
+                }
+                setParameters(parameters)
+                setDisplayOrientation(90)
+                setPreviewDisplay(surfaceView?.holder)
+                startPreview()
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "Camera preview failed", e)
+            showToast("无法启动相机预览")
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "Camera unavailable", e)
+            showToast("相机不可用或已被占用")
+        }
+    }
+
+    private fun captureImage() {
+        camera?.takePicture(null, null, this) ?: showToast("相机未初始化")
+    }
+
+    private fun openGallery() {
+        if (!checkStoragePermission()) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                STORAGE_PERMISSION_REQUEST
+            )
+            return
+        }
+
+        Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI).apply {
+            startActivityForResult(this, PICK_IMAGE_REQUEST)
+        }
+    }
+
+    private fun resetCamera() {
+        previewImage?.visibility = View.GONE
+        previewTouchImage?.visibility = View.GONE // 新增
+        previewControls?.visibility = View.GONE
+        rlBottomTake?.visibility = View.VISIBLE
+        surfaceView?.visibility = View.VISIBLE
+        startCameraPreview()
+    }
+
+    private fun uploadImage() {
+        RetrofitFormNetwork.showLoading()
+        if (previewTouchImage?.visibility == View.VISIBLE) {
+            // 处理相册图片（需要裁剪）
+            previewTouchImage?.let { imageView ->
+                val container = findViewById<RelativeLayout>(R.id.container)
+                val croppedBitmap = getCroppedBitmap(imageView, container)
+                croppedBitmap?.let { saveAndUpload(it) }
+            } ?: showToast("没有可上传的图片")
+        } else {
+            // 处理拍照图片（压缩后上传）
+            currentPhotoFile?.let { file ->
+                Observable.fromCallable {
+                    compressImageFile(file)
+                }
+                    .subscribeOn(Schedulers.io())
+                    .observeOn(AndroidSchedulers.mainThread())
+                    .subscribe({ compressedFile ->
+                        // 使用压缩后的文件上传
+                        orderPresenter?.uploadImage(createUploadObservable(compressedFile)) {
+                            // 上传完成后删除临时压缩文件
+                            if (compressedFile != file) {
+                                compressedFile.delete()
+                            }
+                            finish()
+                        }
+                    }, { error ->
+                        // 压缩失败时使用原文件上传
+                        Log.e(TAG, "图片压缩失败，上传原图")
+                        orderPresenter?.uploadImage(createUploadObservable(file)) {
+                            finish()
+                        }
+                    })
+            } ?: showToast("没有可上传的图片")
+        }
+    }
+
+    /**
+     * 压缩图片文件
+     * @param originalFile 原始图片文件
+     * @return 压缩后的文件（可能是原始文件当不需要压缩时）
+     */
+    private fun compressImageFile(originalFile: File): File {
+        // 1. 检查文件大小，小于1MB不压缩
+        if (originalFile.length() < 1024 * 1024) {
+            return originalFile
+        }
+
+        // 2. 获取图片尺寸信息
+        val options = BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        BitmapFactory.decodeFile(originalFile.absolutePath, options)
+
+        // 3. 计算缩放比例 (目标分辨率1280x1280)
+        val (width, height) = options.run { outWidth to outHeight }
+        val scale = calculateScaleFactor(width, height, 1280f)
+
+        // 4. 解码时进行尺寸压缩
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = scale
+            inPreferredConfig = Bitmap.Config.RGB_565 // 使用更省内存的配置
+        }
+
+        // 5. 解码Bitmap并进行质量压缩
+        return BitmapFactory.decodeFile(originalFile.absolutePath, decodeOptions)?.run {
+            // 创建压缩后的临时文件
+            val compressedFile = File.createTempFile("compressed_", ".jpg", cacheDir)
+
+            // 质量压缩 (初始质量80%，最低50%)
+            var quality = 80
+            do {
+                ByteArrayOutputStream().use { baos ->
+                    compress(Bitmap.CompressFormat.JPEG, quality, baos)
+                    if (baos.size() < 1024 * 1024) { // 小于1MB
+                        compressedFile.outputStream().use { fos ->
+                            fos.write(baos.toByteArray())
+                        }
+                        return compressedFile
+                    }
+                }
+                quality -= 10 // 每次降低10%质量
+            } while (quality >= 50)
+
+            // 压缩失败返回原始文件
+            recycle()
+            originalFile
+        } ?: originalFile // 解码失败返回原始文件
+    }
+
+    /**
+     * 计算缩放比例
+     */
+    private fun calculateScaleFactor(width: Int, height: Int, maxSize: Float): Int {
+        val scale = when {
+            width > height -> width / maxSize
+            else -> height / maxSize
+        }
+        return when {
+            scale <= 1 -> 1
+            scale <= 2 -> 2
+            scale <= 4 -> 4
+            scale <= 8 -> 8
+            else -> 8
+        }
+    }
+
+    private fun createUploadObservable(file: File): Observable<String?> {
+        return Observable.create { subscriber: Subscriber<in String?> ->
+            try {
+                val serverUrl = FileUtil.uploadFile(
+                    FileUtil.MODULE_NAME_OPS,
+                    FileUtil.DOCUMENT_PRE_RECORDER_ORDER,
+                    file.absolutePath
+                )?.getServerUrl(file.absolutePath)
+
+                serverUrl?.takeIf { it.isNotEmpty() }?.let {
+                    orderPresenter?.uploadPreOrder(serverUrl) {}
+                    LogUtils.d("上传成功: $it")
+                    showToast(getString(R.string.uploaded_successfullys))
+                    subscriber.onNext(it)
+                } ?: run {
+                    subscriber.onError(Exception("上传返回空URL"))
+                }
+                RetrofitFormNetwork.dismissLoading()
+            } catch (e: Exception) {
+                LogUtils.e("上传失败: ${e.message}")
+                RetrofitFormNetwork.dismissLoading()
+                subscriber.onError(e)
+            } finally {
+                subscriber.onCompleted()
+            }
+        }
+    }
+
+    override fun onPictureTaken(data: ByteArray?, camera: Camera?) {
+        data?.let {
+            Observable.just(it)
+                .subscribeOn(Schedulers.io())
+                .observeOn(AndroidSchedulers.mainThread())
+                .subscribe({ bytes ->
+                    try {
+                        currentPhotoFile = createImageFile()
+                        FileOutputStream(currentPhotoFile).use { it.write(bytes) }
+                        showPreview(currentPhotoFile!!)
+                    } catch (e: IOException) {
+                        Log.e(TAG, "保存图片失败", e)
+                        showToast("保存图片失败")
+                    }
+                }, { e ->
+                    Log.e(TAG, "图片处理错误", e)
+                    showToast("图片处理错误")
+                })
+        } ?: showToast("拍照数据为空")
+
+        // 重启预览
+        camera?.startPreview()
+    }
+
+    @Throws(IOException::class)
+    private fun createImageFile(): File {
+        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+        val imageFileName = "JPEG_${timeStamp}_"
+        val storageDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+        return File.createTempFile(imageFileName, ".jpg", storageDir)
+    }
+
+    private fun showPreview(imageFile: File, isFromAlbum: Boolean = false) {
+        releaseCamera()
+
+        Observable.just(imageFile)
+            .subscribeOn(Schedulers.io())
+            .map { file ->
+                val options = BitmapFactory.Options().apply {
+                    inSampleSize = 2 // 缩小图片尺寸减少内存占用
+                }
+                val bitmap = BitmapFactory.decodeFile(file.absolutePath, options)
+                //take photo 旋转90°刚好正向
+                var matrix = Matrix().apply { postRotate(90f) }
+                if(isFromAlbum){
+                    matrix = Matrix().apply { postRotate(0f) }
+                }
+
+                Bitmap.createBitmap(
+                    bitmap, 0, 0,
+                    bitmap.width, bitmap.height,
+                    matrix, true
+                ).also {
+//                    bitmap.recycle()
+                }
+            }
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe({ bitmap ->
+                if (isFromAlbum) {
+                    // 相册图片：使用TouchImageView
+                    previewImage?.visibility = View.GONE
+                    previewTouchImage?.apply {
+                        setImageBitmap(bitmap)
+                        visibility = View.VISIBLE
+                    }
+                } else {
+                    // 拍照图片：使用普通ImageView
+                    previewTouchImage?.visibility = View.GONE
+                    previewImage?.apply {
+                        setImageBitmap(bitmap)
+                        visibility = View.VISIBLE
+                    }
+                }
+
+                previewControls?.visibility = View.VISIBLE
+                rlBottomTake?.visibility = View.GONE
+                surfaceView?.visibility = View.GONE
+            }, { e ->
+                Log.e(TAG, "图片预览失败", e)
+                showToast("无法加载图片")
+                resetCamera()
+            })
+    }
+
+    private fun getCroppedBitmap(imageView: TouchImageView, container: View): Bitmap {
+        // 1. 获取裁剪框在屏幕上的位置
+        val location = IntArray(2)
+        container.getLocationOnScreen(location)
+        val left = location[0]
+        val top = location[1]
+        val right = left + container.width
+        val bottom = top + container.height
+
+        // 2. 创建与裁剪框相同大小的Bitmap
+        val bitmap = Bitmap.createBitmap(
+            container.width,
+            container.height,
+            Bitmap.Config.ARGB_8888
+        )
+
+        // 3. 将ImageView的内容绘制到Bitmap上（只绘制裁剪框区域）
+        val canvas = Canvas(bitmap)
+        canvas.translate(
+            -imageView.scrollX.toFloat() - left,
+            -imageView.scrollY.toFloat() - top
+        )
+        imageView.draw(canvas)
+
+        return bitmap
+    }
+
+    private fun saveAndUpload(bitmap: Bitmap) {
+        Observable.fromCallable {
+            val file = createImageFile()
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+            }
+            bitmap.recycle()
+            file
+        }
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe({ file ->
+                // 上传文件
+                orderPresenter?.uploadImage(createUploadObservable(file)) {
+                    finish()
+                }
+            }, { e ->
+                Log.e(TAG, "保存裁剪图片失败", e)
+                showToast("保存图片失败")
+            })
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == PICK_IMAGE_REQUEST && resultCode == RESULT_OK) {
+            data?.data?.let { uri ->
+                contentResolver.query(uri, arrayOf(MediaStore.Images.Media.DATA), null, null, null)
+                    ?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val pathIndex = cursor.getColumnIndex(MediaStore.Images.Media.DATA)
+                            if (pathIndex != -1) {
+                                currentPhotoFile = File(cursor.getString(pathIndex))
+                                showPreview(currentPhotoFile!!, true)
+                            }
+                        }
+                    }
+            } ?: showToast("未选择图片")
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        when (requestCode) {
+            CAMERA_PERMISSION_REQUEST -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    initCamera()
+                } else {
+                    showToast("需要相机权限才能使用此功能")
+                    finish()
+                }
+            }
+            STORAGE_PERMISSION_REQUEST -> {
+                if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    openGallery()
+                } else {
+                    showToast("需要存储权限访问相册")
+                }
+            }
+        }
+    }
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        isSurfaceCreated = true
+        if (checkCameraPermission()) {
+            startCameraPreview()
+        }
+    }
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        // 重新启动预览
+        if (holder.surface == null) return
+        try {
+            camera?.apply {
+                stopPreview()
+                setPreviewDisplay(holder)
+                startPreview()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "surfaceChanged error", e)
+        }
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        isSurfaceCreated = false
+        releaseCamera()
+    }
+
+    private fun releaseCamera() {
+        camera?.apply {
+            stopPreview()
+            release()
+        }
+        camera = null
+    }
+
+    private fun showToast(message: String) {
+        ToastUtils.show(message)
+    }
+
+    override fun attachBaseContext(newBase: Context?) {
+        super.attachBaseContext(LocalManageUtil.setLocal(newBase))
+    }
+
+    override fun getResources(): Resources {
+        return LocalManageUtil.setLocal(baseContext).resources
+    }
+}
